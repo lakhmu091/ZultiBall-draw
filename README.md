@@ -1,27 +1,43 @@
-# Zultiball AI — Server Target
+# Zultiball AI — Live Draw Monitor
 
 ## Features
-- Connects to an authorized JSON API endpoint (not website HTML).
-- Fetches the current server response on app load and on demand.
-- Parses common JSON number fields: `winning_numbers`, `winningNumbers`, `numbers`, `draw_numbers`, `drawNumbers`, `balls`, `winning`.
-- Optional auto-refresh at 15, 30, 60, 120, or 300 seconds.
-- Shows JSON preview when no reliable number list is detected.
-- Saves results only after explicit user confirmation against an authoritative result.
-- Stores verified history locally in `data/verified_draws.csv` and provides CSV export.
+- Authorized JSON API fetch with configurable JSON paths.
+- Public webpage fallback using CSS selectors, JSON-LD, and a cautious text candidate scan.
+- Candidate confirmation before public-page results are saved.
+- Manual verified draw entry.
+- Automatic refresh and configurable fetch interval.
+- Verified history, frequency charts, timeline, and CSV export.
 
-## Run
+## Run locally
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Community Cloud
-Upload this ZIP's contents to GitHub and deploy `app.py`. Add secrets under App Settings → Secrets:
-```toml
-ZULTI_API_URL = "https://YOUR-AUTHORIZED-API-ENDPOINT"
-ZULTI_API_TOKEN = "OPTIONAL_BEARER_TOKEN"
-```
-The URL must be the actual authorized server/API endpoint that returns JSON. This project does not guess or claim to know Zulti's private endpoint. If the server returns a different JSON shape, use the JSON preview to adapt the parser.
+## Deploy to Streamlit Community Cloud
+1. Extract this ZIP.
+2. Upload `app.py`, `requirements.txt`, and `README.md` to GitHub.
+3. Create a Streamlit Community Cloud app using `app.py`.
+4. Enter an authorized API URL or a publicly accessible results page in the sidebar.
+5. For JSON API mode, set paths such as `draw.id`, `draw.date`, and `draw.numbers`.
+6. For public page mode, set CSS selector for the numbers element if known (e.g. `.winning-numbers`).
+7. Verify a detected candidate before saving.
 
-## Verification note
-Parsing a number array proves only that the API returned those values. It does not prove that they are official winning numbers. The app therefore requires the user to independently verify a result before saving it as verified.
+## Example JSON
+```json
+{
+  "draw": {
+    "id": "DRAW-1001",
+    "date": "2026-11-10",
+    "numbers": [3, 8, 14, 22, 31, 40]
+  }
+}
+```
+
+## Important limitations
+- The public-page parser uses HTTP HTML and cannot run client-side JavaScript.
+- It cannot bypass authentication, CAPTCHA, access controls, or private APIs.
+- A candidate from heuristic extraction is not automatically treated as verified.
+- Streamlit Community Cloud local files may not persist through restarts/redeployments. Use a database for durable production storage.
+- Frequency charts describe historical observations; they do not predict or guarantee future results.
+- Do not publish API keys in GitHub. Use Streamlit secrets or a secure server-side secret store for production.

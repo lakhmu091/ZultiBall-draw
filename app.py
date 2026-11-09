@@ -1,207 +1,238 @@
-import json
-import os
-from datetime import datetime, timezone
+import json, re
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Zultiball AI — Server Target", page_icon="🎯", layout="wide")
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-HISTORY_FILE = DATA_DIR / "verified_draws.csv"
+st.set_page_config(page_title="Zultiball AI — Live Draw Monitor", page_icon="🎯", layout="wide")
+DB = Path("verified_draws.csv")
+TIMEOUT = 20
+UA = "Mozilla/5.0 (compatible; ZultiballDrawMonitor/1.0)"
 
-st.markdown("""
-<style>
-.stApp {background:#080d0b;color:#e8fff1}
-[data-testid="stSidebar"] {background:#101914}
-h1,h2,h3 {color:#63f59a !important}
-div[data-testid="stMetric"] {background:#101914;padding:14px;border:1px solid #245b3b;border-radius:12px}
-</style>
-""", unsafe_allow_html=True)
+st.title("🎯 Zultiball AI — Live Draw Monitor")
+st.caption("Authorized API + public-page fallback + verified history + statistics")
 
-st.title("🎯 Zultiball AI — Server Target")
-st.caption("Authorized server/API connection • current draw retrieval • JSON parsing • auto-refresh")
-
-def get_secret(name, default=""):
-    try:
-        return st.secrets.get(name, os.getenv(name, default))
-    except Exception:
-        return os.getenv(name, default)
-
-with st.sidebar:
-    st.header("Server connection")
-    api_url = st.text_input("Authorized API URL", value=get_secret("ZULTI_API_URL"),
-                            placeholder="https://your-authorized-api-endpoint")
-    token = st.text_input("Bearer token (optional)", value=get_secret("ZULTI_API_TOKEN"), type="password")
-    timeout = st.slider("Request timeout (seconds)", 5, 60, 20)
-    st.divider()
-    st.subheader("Auto-refresh")
-    auto_refresh = st.toggle("Enable automatic current-draw refresh", value=False)
-    refresh_seconds = st.selectbox("Refresh interval", [15, 30, 60, 120, 300], index=2)
-    st.caption("Auto-refresh runs only after an authorized API URL is configured.")
-
-def extract_numbers(payload):
-    keyset = {"winning_numbers", "winningNumbers", "numbers", "draw_numbers",
-              "drawNumbers", "balls", "winning"}
-    candidates = []
-    def walk(obj, path="$"):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if str(k) in keyset:
-                    candidates.append((path + "." + str(k), v))
-                walk(v, path + "." + str(k))
-        elif isinstance(obj, list):
-            if obj and all(str(x).strip().isdigit() for x in obj):
-                candidates.append((path, obj))
-            else:
-                for i, v in enumerate(obj):
-                    walk(v, f"{path}[{i}]")
-    walk(payload)
-    for source, value in candidates:
-        if isinstance(value, dict):
-            value = value.get("numbers") or value.get("values") or value.get("balls")
-        if isinstance(value, list):
-            try:
-                nums = [int(str(x).strip()) for x in value if str(x).strip().isdigit()]
-                if 5 <= len(nums) <= 20 and len(nums) == len(set(nums)) and all(n > 0 for n in nums):
-                    return nums, source
-            except (TypeError, ValueError):
-                continue
-    return None, None
-
-def request_current_draw(url, bearer, timeout_s):
-    headers = {"Accept": "application/json", "User-Agent": "ZultiballAI/1.1"}
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    response = requests.get(url, headers=headers, timeout=timeout_s)
-    response.raise_for_status()
-    try:
-        return response.json(), response.status_code
-    except ValueError as exc:
-        raise ValueError("API response was not valid JSON. Provide the server's JSON endpoint.") from exc
-
-def load_history():
-    if HISTORY_FILE.exists():
+def read_db():
+    if DB.exists():
         try:
-            return pd.read_csv(HISTORY_FILE)
+            df = pd.read_csv(DB)
+            required = ["draw_id", "draw_date", "numbers", "verified", "source"]
+            if all(c in df.columns for c in required):
+                return df
         except Exception:
             pass
-    return pd.DataFrame(columns=["draw_id", "draw_date", "numbers", "source", "verified_at"])
+    return pd.DataFrame(columns=["draw_id", "draw_date", "numbers", "verified", "source"])
 
-def save_draw(draw_id, draw_date, numbers, source):
-    df = load_history()
-    draw_id = str(draw_id or f"manual-{datetime.now().strftime('%Y%m%d%H%M%S')}")
-    if not df.empty and draw_id in df["draw_id"].astype(str).values:
-        return False, "That draw ID is already in saved history."
-    row = {"draw_id": draw_id, "draw_date": str(draw_date),
-           "numbers": ",".join(map(str, numbers)), "source": source,
-           "verified_at": datetime.now(timezone.utc).isoformat()}
-    pd.concat([df, pd.DataFrame([row])], ignore_index=True).to_csv(HISTORY_FILE, index=False)
-    return True, "Saved to verified history."
+def write_db(df):
+    df.to_csv(DB, index=False)
 
-# Refresh tick; the actual endpoint is still required.
-if auto_refresh and api_url.strip():
-    st_autorefresh(interval=refresh_seconds * 1000, key="zulti_auto_refresh")
-
-# Fetch on initial load, manual request, or each auto-refresh tick.
-should_fetch = bool(api_url.strip()) and (
-    "api_payload" not in st.session_state or
-    st.session_state.get("last_refresh_tick") != st.session_state.get("zulti_auto_refresh", 0)
-)
-manual_fetch = st.button("Fetch current draw now", type="primary")
-if manual_fetch:
-    should_fetch = True
-
-if should_fetch:
+def parse_numbers(value):
+    if isinstance(value, str):
+        raw = re.findall(r"(?<!\d)\d+(?!\d)", value)
+    elif isinstance(value, list):
+        raw = value
+    else:
+        return None
     try:
-        payload, status = request_current_draw(api_url.strip(), token.strip(), timeout)
-        nums, source_path = extract_numbers(payload)
-        st.session_state["api_payload"] = payload
-        st.session_state["api_status"] = status
-        st.session_state["candidate_numbers"] = nums
-        st.session_state["candidate_path"] = source_path
-        st.session_state["fetch_time"] = datetime.now(timezone.utc).isoformat()
-        st.session_state["last_refresh_tick"] = st.session_state.get("zulti_auto_refresh", 0)
-        st.session_state["fetch_error"] = None
-    except Exception as exc:
-        st.session_state["fetch_error"] = str(exc)
+        nums = [int(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
+    if not 5 <= len(nums) <= 20 or any(n <= 0 for n in nums) or len(set(nums)) != len(nums):
+        return None
+    return nums
 
-if not api_url.strip():
-    st.info("Enter the authorized server/API URL in the sidebar. The app cannot identify or invent Zulti's private API endpoint.")
-else:
-    left, right = st.columns([1, 1])
-    with left:
-        st.subheader("Current draw — server response")
-        if st.session_state.get("fetch_error"):
-            st.error(st.session_state["fetch_error"])
-        elif "api_payload" in st.session_state:
-            st.caption(f"HTTP {st.session_state.get('api_status')} • fetched {st.session_state.get('fetch_time', '')}")
-            candidate = st.session_state.get("candidate_numbers")
-            if candidate:
-                st.success("Number list parsed from the server response.")
-                st.metric("Parsed number count", len(candidate))
-                st.write("**Server-reported numbers:**", candidate)
-                st.caption(f"JSON field: {st.session_state.get('candidate_path')}")
-            else:
-                st.warning("No reliable winning-number list found. Nothing was saved.")
-                with st.expander("JSON response preview"):
-                    st.code(json.dumps(st.session_state["api_payload"], indent=2)[:12000], language="json")
-        if auto_refresh:
-            st.caption(f"Auto-refresh enabled: every {refresh_seconds} seconds.")
-    with right:
-        st.subheader("Verification")
-        candidate = st.session_state.get("candidate_numbers")
-        draw_id = st.text_input("Draw ID (if supplied by API)", key="server_draw_id")
-        draw_date = st.date_input("Draw date", value=datetime.now().date(), key="server_draw_date")
-        st.warning("A parsed API response is server-reported, not independently verified. Confirm it against an authoritative result before saving.")
-        confirmed = st.checkbox("I independently checked this draw against an official/authoritative result.")
-        if st.button("Save verified current draw", disabled=not (candidate and confirmed), use_container_width=True):
-            ok, message = save_draw(draw_id, draw_date.isoformat(), candidate, "server_api_user_verified")
-            (st.success if ok else st.warning)(message)
+def get_path(obj, path):
+    cur = obj
+    for key in filter(None, path.strip().split(".")):
+        if isinstance(cur, list) and key.isdigit() and int(key) < len(cur):
+            cur = cur[int(key)]
+        elif isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return None
+    return cur
+
+def save_draw(draw_id, draw_date, nums, source):
+    df = read_db()
+    row = {"draw_id": str(draw_id), "draw_date": str(draw_date),
+           "numbers": ",".join(map(str, nums)), "verified": True, "source": source}
+    if not df.empty:
+        df = df[df.draw_id.astype(str) != str(draw_id)]
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    write_db(df)
+
+def request_page(url, headers):
+    r = requests.get(url, headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r
+
+def parse_json_api(payload, id_path, date_path, nums_path):
+    draw_id = get_path(payload, id_path)
+    draw_date = get_path(payload, date_path)
+    nums = parse_numbers(get_path(payload, nums_path))
+    if draw_id is None or nums is None:
+        raise ValueError("Configured JSON paths did not return a draw ID and 5–20 unique positive numbers.")
+    return str(draw_id), str(draw_date or date.today().isoformat()), nums
+
+def parse_public_page(html, id_selector, date_selector, numbers_selector):
+    soup = BeautifulSoup(html, "html.parser")
+    # Prefer configured CSS selectors.
+    if numbers_selector.strip():
+        node = soup.select_one(numbers_selector)
+        if node:
+            nums = parse_numbers(node.get("content") or node.get_text(" ", strip=True))
+            if nums:
+                id_node = soup.select_one(id_selector) if id_selector.strip() else None
+                date_node = soup.select_one(date_selector) if date_selector.strip() else None
+                draw_id = (id_node.get("content") or id_node.get_text(" ", strip=True)) if id_node else "public-page-" + date.today().isoformat()
+                draw_date = (date_node.get("content") or date_node.get_text(" ", strip=True)) if date_node else date.today().isoformat()
+                return str(draw_id), str(draw_date), nums, "CSS selector"
+
+    # Try structured JSON-LD blocks. This is heuristic, so the user must confirm.
+    for tag in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(tag.string or tag.get_text())
+            candidates = data if isinstance(data, list) else [data]
+            for item in candidates:
+                if isinstance(item, dict):
+                    for key in ("winningNumbers", "numbers", "results", "number"):
+                        nums = parse_numbers(item.get(key))
+                        if nums:
+                            return str(item.get("identifier") or item.get("name") or "public-jsonld"), str(item.get("datePublished") or date.today().isoformat()), nums, "JSON-LD"
+        except Exception:
+            continue
+
+    # Last-resort candidate scan: report candidate only; never auto-save.
+    text = soup.get_text(" ", strip=True)
+    matches = re.findall(r"(?<!\d)(?:\d{1,3}\s*[,|]\s*){4,19}\d{1,3}(?!\d)", text)
+    for candidate in matches:
+        nums = parse_numbers(candidate)
+        if nums:
+            return "public-candidate-" + date.today().isoformat(), date.today().isoformat(), nums, "text heuristic candidate"
+    raise ValueError("No recognizable public winning-number list found. The page may be client-rendered, protected, or use a different structure.")
+
+with st.sidebar:
+    st.header("1) Data source")
+    mode = st.radio("Connection mode", ["Authorized JSON API", "Public webpage fallback", "Manual only"])
+    url = st.text_input("API / public page URL", placeholder="https://your-authorized-server.example/api/draw")
+    headers_raw = st.text_area("Request headers (JSON)", '{"User-Agent":"Mozilla/5.0"}', height=80)
+    refresh = st.number_input("Auto-refresh (seconds)", 0, 3600, 60, 5)
+    auto_fetch = st.checkbox("Fetch automatically on each refresh", value=True)
+    st.divider()
+    st.header("2) API JSON mapping")
+    id_path = st.text_input("Draw ID path", "draw.id")
+    date_path = st.text_input("Draw date path", "draw.date")
+    nums_path = st.text_input("Numbers path", "draw.numbers")
+    st.divider()
+    st.header("3) Public page CSS selectors")
+    id_css = st.text_input("Draw ID selector (optional)", "")
+    date_css = st.text_input("Draw date selector (optional)", "")
+    nums_css = st.text_input("Winning numbers selector", "")
+    st.caption("Example selector: .winning-numbers or #result-numbers")
+
+if refresh > 0:
+    st_autorefresh(interval=int(refresh * 1000), key="zulti_refresh")
+
+def run_fetch():
+    if not url.strip():
+        st.warning("Enter a URL in the sidebar.")
+        return
+    try:
+        headers = json.loads(headers_raw or "{}")
+        if not isinstance(headers, dict):
+            raise ValueError("Headers must be a JSON object.")
+        response = request_page(url.strip(), headers)
+        content_type = response.headers.get("content-type", "").lower()
+        if mode == "Authorized JSON API" or "json" in content_type:
+            payload = response.json()
+            did, ddate, nums = parse_json_api(payload, id_path, date_path, nums_path)
+            save_draw(did, ddate, nums, "Authorized JSON API")
+            st.success(f"Fetched and saved draw {did}: {', '.join(map(str, nums))}")
+        else:
+            did, ddate, nums, method_used = parse_public_page(response.text, id_css, date_css, nums_css)
+            st.session_state["candidate"] = {"id": did, "date": ddate, "nums": nums, "method": method_used}
+            st.info(f"Found a candidate using {method_used}: {', '.join(map(str, nums))}. Confirm it below before saving.")
+    except requests.RequestException as e:
+        st.error(f"Request failed: {e}")
+    except (ValueError, json.JSONDecodeError) as e:
+        st.error(str(e))
+    except Exception as e:
+        st.error(f"Could not process source: {e}")
+
+col_a, col_b = st.columns([1, 3])
+with col_a:
+    if st.button("🔄 Fetch now", type="primary", use_container_width=True):
+        run_fetch()
+with col_b:
+    st.caption("Auto-fetch runs on refresh only when a URL is entered and automatic fetching is enabled.")
+if refresh > 0 and auto_fetch and url.strip() and mode != "Manual only":
+    # Avoid a request on the initial render if no prior refresh cycle has elapsed.
+    if st.session_state.get("_auto_fetch_ready", False):
+        run_fetch()
+    st.session_state["_auto_fetch_ready"] = True
+
+if "candidate" in st.session_state:
+    c = st.session_state["candidate"]
+    st.subheader("Public-page candidate — verification required")
+    st.write(f"**Candidate draw:** {c['id']}  |  **Date:** {c['date']}")
+    st.write("**Candidate numbers:** " + ", ".join(map(str, c["nums"])))
+    confirm = st.checkbox("I checked this candidate against the official result and confirm it is correct.", key="candidate_confirm")
+    if st.button("Save confirmed candidate"):
+        if confirm:
+            save_draw(c["id"], c["date"], c["nums"], "Public page — user confirmed")
+            del st.session_state["candidate"]
+            st.success("Confirmed draw saved.")
+            st.rerun()
+        else:
+            st.error("Please verify the candidate before saving.")
 
 st.divider()
 st.subheader("Manual verified entry")
-with st.form("manual_entry"):
-    manual_id = st.text_input("Draw ID")
-    manual_date = st.date_input("Manual draw date", value=datetime.now().date())
-    manual_numbers = st.text_input("Winning numbers (comma-separated)", placeholder="3, 8, 14, 22, 31, 40")
+with st.form("manual"):
+    a, b = st.columns(2)
+    manual_id = a.text_input("Draw ID")
+    manual_date = b.date_input("Draw date", value=date.today())
+    manual_nums = st.text_input("Winning numbers (comma-separated)", "3, 8, 14, 22, 31, 40")
     manual_confirm = st.checkbox("I independently verified this result.")
-    submitted = st.form_submit_button("Save manual verified draw")
-    if submitted:
-        try:
-            values = [int(x.strip()) for x in manual_numbers.split(",") if x.strip()]
-            if not manual_confirm:
-                st.error("Verification checkbox is required.")
-            elif not (5 <= len(values) <= 20) or len(values) != len(set(values)) or any(x <= 0 for x in values):
-                st.error("Enter 5–20 unique positive integers.")
-            else:
-                ok, message = save_draw(manual_id, manual_date.isoformat(), values, "manual_user_verified")
-                (st.success if ok else st.warning)(message)
-        except ValueError:
-            st.error("Numbers must be comma-separated integers.")
+    submit = st.form_submit_button("Save manual draw")
+    if submit:
+        nums = parse_numbers(manual_nums)
+        if not manual_id.strip():
+            st.error("Draw ID is required.")
+        elif nums is None:
+            st.error("Enter 5–20 unique positive integers.")
+        elif not manual_confirm:
+            st.error("Confirm independent verification before saving.")
+        else:
+            save_draw(manual_id, manual_date.isoformat(), nums, "Manual verified entry")
+            st.success("Verified draw saved.")
+            st.rerun()
 
 st.divider()
 st.subheader("Verified draw history & statistics")
-history = load_history()
-if history.empty:
+hist = read_db()
+if hist.empty:
     st.info("No verified draws saved yet.")
 else:
-    st.dataframe(history.sort_values("draw_date", ascending=False), use_container_width=True, hide_index=True)
-    observed = []
-    for item in history["numbers"].dropna():
-        observed.extend(int(x) for x in str(item).split(",") if x.strip().isdigit())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Saved verified draws", len(history))
-    c2.metric("Number observations", len(observed))
-    c3.metric("Distinct numbers", len(set(observed)))
-    if observed:
-        frequencies = pd.Series(observed).value_counts().sort_values(ascending=False)
-        st.write("Historical frequency (descriptive only)")
-        st.bar_chart(frequencies.head(15))
-    st.download_button("Download history CSV", history.to_csv(index=False).encode("utf-8"),
-                       file_name="zultiball_verified_history.csv", mime="text/csv")
+    hist = hist[hist["verified"].astype(str).str.lower().isin(["true", "1"])]
+    st.dataframe(hist.sort_values("draw_date", ascending=False), use_container_width=True, hide_index=True)
+    flat = []
+    for cell in hist["numbers"].dropna():
+        flat.extend(parse_numbers(str(cell)) or [])
+    if flat:
+        freq = pd.Series(flat).value_counts().sort_index().rename_axis("Number").reset_index(name="Frequency")
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(px.bar(freq, x="Number", y="Frequency", title="Verified number frequency"), use_container_width=True)
+        with right:
+            st.plotly_chart(px.histogram(freq, x="Frequency", title="Frequency distribution"), use_container_width=True)
+    timeline = hist.groupby("draw_date").size().reset_index(name="Draws")
+    st.plotly_chart(px.line(timeline, x="draw_date", y="Draws", markers=True, title="Verified draws over time"), use_container_width=True)
+    st.download_button("Download history CSV", hist.to_csv(index=False).encode(), "verified_draws.csv", "text/csv")
 
-st.caption("No lottery prediction is guaranteed. Historical frequencies do not change the probability of a future random draw.")
+st.warning("This tool cannot guarantee predictions. Public-page extraction is heuristic and requires confirmation. It cannot execute browser JavaScript, defeat CAPTCHA, bypass logins, or access private endpoints without authorization.")
